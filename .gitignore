@@ -1,0 +1,53 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+.DS_Store
+.venv/
+.venv-*/
+venv/
+*.egg-info/
+build/
+dist/
+.env
+*.log
+
+checkpoints/
+models/
+swanlog/
+swanlab/
+wandb/
+logs/
+
+# Generated artifacts: retain evaluation reports, summaries and run metadata.
+/outputs/*
+!/outputs/evaluation/
+/outputs/evaluation/**
+!/outputs/evaluation/**/
+!/outputs/evaluation/**/report.html
+!/outputs/evaluation/**/summary.json
+!/outputs/evaluation/**/run.json
+!/outputs/evaluation/**/comparison.md
+!/outputs/evaluation/**/comparison.json
+
+# Raw trajectories and rollout dumps (including the legacy .jsons format).
+trajectories*.jsonl
+trajectories*.jsons
+trajectories*.json
+trajectory*.jsonl
+trajectory*.json
+rollout*.jsonl
+rollout*.json
+trace*.jsonl
+trace*.json
+
+# SFT conversations contain full trajectories; keep metadata and task lists.
+/data/sft/**/*.jsonl
+/data/sft_pure_v4/all.jsonl
+/data/sft_curriculum/**/*.jsonl
+
+# Example and generated trajectory files are excluded by the rules above.
