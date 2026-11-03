@@ -190,6 +190,9 @@ critic:
   fsdp:
     param_offload: true
     optimizer_offload: true
+    # SAO freezes critic attention before FSDP wrapping.  Keep original
+    # parameters so FSDP can represent mixed frozen/trainable tensors.
+    use_orig_params: true
 
 shopping_sao:
   enable: true

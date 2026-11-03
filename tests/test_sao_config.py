@@ -6,7 +6,11 @@ import os
 import unittest
 from unittest.mock import patch
 
-from scripts.check_grpo_runtime import compose_runtime_config, validate_sao
+from scripts.check_grpo_runtime import (
+    compose_runtime_config,
+    validate_fully_async,
+    validate_sao,
+)
 
 
 class SAOConfigTest(unittest.TestCase):
@@ -41,6 +45,33 @@ class SAOConfigTest(unittest.TestCase):
         with patch.dict(os.environ, {"GRPO_CONFIG_NAME": "grpo"}, clear=False):
             config = compose_runtime_config([])
         validate_sao(config)
+
+    def test_fully_async_recipe_decouples_resources_and_bounds_staleness(self):
+        with patch.dict(
+            os.environ,
+            {"GRPO_CONFIG_NAME": "sao_fully_async", "GRPO_FULLY_ASYNC": "1"},
+            clear=False,
+        ):
+            config = compose_runtime_config([])
+            validate_sao(config)
+            validate_fully_async(config)
+
+        self.assertFalse(config.actor_rollout_ref.hybrid_engine)
+        self.assertTrue(config.actor_rollout_ref.actor.use_rollout_log_probs)
+        self.assertEqual(config.actor_rollout_ref.rollout.checkpoint_engine.backend, "nccl")
+        self.assertEqual(config.async_training.trigger_parameter_sync_step, 1)
+        self.assertGreater(config.async_training.staleness_threshold, 0)
+        self.assertEqual(config.rollout.n, 1)
+
+    def test_fully_async_rejects_zero_staleness(self):
+        with patch.dict(
+            os.environ,
+            {"GRPO_CONFIG_NAME": "sao_fully_async", "GRPO_FULLY_ASYNC": "1"},
+            clear=False,
+        ):
+            config = compose_runtime_config(["async_training.staleness_threshold=0"])
+            with self.assertRaisesRegex(SystemExit, "staleness_threshold"):
+                validate_fully_async(config)
 
 
 if __name__ == "__main__":  # pragma: no cover

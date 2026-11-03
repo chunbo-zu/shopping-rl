@@ -116,8 +116,8 @@ def compact_token_trajectory(
 
     # response_mask 标记 assistant 输出，前面的 token 是不能单独删除的固定 prompt。
     initial_prompt_length = len(prompt_ids) - len(response_mask)
-    group_ends = _complete_token_group_ends(response_mask)
-    removable_group_ends = group_ends[:-preserve_recent_groups]
+    group_ends = _complete_token_group_ends(response_mask) #拿到结尾位置
+    removable_group_ends = group_ends[:-preserve_recent_groups] #拿到最旧的group的结尾位置，也就是最前面的一个group.
     required_removal = original_tokens - max_input_tokens
     drop_count = next(
         (end for end in removable_group_ends if end >= required_removal),

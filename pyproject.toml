@@ -29,6 +29,8 @@ sft-accelerated = [
 ]
 grpo = [
   "verl==0.8.0",
+  "trl==0.23.1",
+  "cupy-cuda13x==14.2.0",
   "vllm==0.25.1",
   "torch==2.11.0",
   "torchvision==0.26.0",

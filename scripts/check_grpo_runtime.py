@@ -13,6 +13,8 @@ from pathlib import Path
 
 EXPECTED_VERSIONS = {
     "verl": "0.8.0",
+    "trl": "0.23.1",
+    "cupy-cuda13x": "14.2.0",
     "vllm": "0.25.1",
     "torch": "2.11.0",
     "transformers": "5.15.0.dev0",
@@ -317,6 +319,10 @@ def validate_sao(config):
         raise SystemExit("shopping SAO requires skip_observation_gae=true")
     if not bool(sao.get("freeze_critic_attention", False)):
         raise SystemExit("shopping SAO requires freeze_critic_attention=true")
+    if not bool(config.get("critic", {}).get("fsdp", {}).get("use_orig_params", False)):
+        raise SystemExit(
+            "shopping SAO requires critic.fsdp.use_orig_params=true when attention is frozen"
+        )
 
     low_clip = float(
         correction.get("sao_low_clip", sao.get("low_clip", -1))
@@ -351,6 +357,90 @@ def validate_sao(config):
                 "freeze_critic_attention": True,
                 "actor_ppo_epochs": actor_epochs,
                 "critic_ppo_epochs": critic_epochs,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def validate_fully_async(config):
+    """Validate the separate Rollouter/Trainer execution contract.
+
+    ``rollout.mode=async`` only selects an asynchronous inference server.  The
+    fully_async_policy entrypoint additionally needs independent resource pools,
+    a streaming queue, rollout log-probs, and a positive staleness budget.
+    """
+    if os.environ.get("GRPO_FULLY_ASYNC") != "1":
+        return
+
+    async_config = config.get("async_training")
+    if async_config is None:
+        raise SystemExit("fully async training requires an async_training config")
+
+    staleness = float(async_config.get("staleness_threshold", 0.0))
+    trigger_steps = int(async_config.get("trigger_parameter_sync_step", 0))
+    require_batches = int(async_config.get("require_batches", 0))
+    if not math.isfinite(staleness) or staleness <= 0:
+        raise SystemExit(
+            "fully async training requires async_training.staleness_threshold > 0"
+        )
+    if trigger_steps <= 0 or require_batches <= 0:
+        raise SystemExit(
+            "fully async training requires positive parameter sync and queue batch sizes"
+        )
+
+    actor_rollout_ref = config.actor_rollout_ref
+    if bool(actor_rollout_ref.get("hybrid_engine", True)):
+        raise SystemExit(
+            "fully async training requires actor_rollout_ref.hybrid_engine=false"
+        )
+    actor = actor_rollout_ref.actor
+    rollout_actor = actor_rollout_ref.rollout
+    if not bool(actor.get("use_rollout_log_probs", False)):
+        raise SystemExit(
+            "fully async training requires actor.use_rollout_log_probs=true"
+        )
+    if not bool(rollout_actor.get("calculate_log_probs", False)):
+        raise SystemExit(
+            "fully async training requires rollout.calculate_log_probs=true"
+        )
+    checkpoint_engine = rollout_actor.get("checkpoint_engine", {})
+    if str(checkpoint_engine.get("backend", "")).lower() != "nccl":
+        raise SystemExit(
+            "fully async training requires rollout.checkpoint_engine.backend=nccl"
+        )
+
+    trainer = config.trainer
+    rollout = config.rollout
+    for name, value in (
+        ("trainer.nnodes", trainer.get("nnodes", 0)),
+        ("trainer.n_gpus_per_node", trainer.get("n_gpus_per_node", 0)),
+        ("rollout.nnodes", rollout.get("nnodes", 0)),
+        ("rollout.n_gpus_per_node", rollout.get("n_gpus_per_node", 0)),
+    ):
+        if int(value) <= 0:
+            raise SystemExit(f"fully async training requires positive {name}")
+    if int(config.data.get("gen_batch_size", 0)) != 1:
+        raise SystemExit("fully async training requires data.gen_batch_size=1")
+    if int(config.data.get("train_batch_size", -1)) != 0:
+        raise SystemExit("fully async training requires data.train_batch_size=0")
+    if int(rollout.get("n", 0)) != 1:
+        raise SystemExit("SAO fully async training requires rollout.n=1")
+    if int(rollout.get("total_rollout_steps", 0)) <= 0:
+        raise SystemExit("fully async training requires rollout.total_rollout_steps > 0")
+
+    print(
+        "shopping fully async preflight passed: "
+        + json.dumps(
+            {
+                "trainer_gpus": int(trainer.n_gpus_per_node) * int(trainer.nnodes),
+                "rollout_gpus": int(rollout.n_gpus_per_node) * int(rollout.nnodes),
+                "staleness_threshold": staleness,
+                "trigger_parameter_sync_step": trigger_steps,
+                "require_batches": require_batches,
+                "partial_rollout": bool(async_config.get("partial_rollout", False)),
+                "rollout_log_probs": True,
+                "checkpoint_backend": "nccl",
             },
             sort_keys=True,
         )
@@ -509,6 +599,7 @@ def main():
         raise SystemExit("missing GRPO parquet file(s): " + ", ".join(missing))
     validate_training_memory_budget(config)
     validate_sao(config)
+    validate_fully_async(config)
     validate_trace(config)
 
     if sys.version_info[:2] != (3, 12):
@@ -529,6 +620,9 @@ def main():
     try:
         import torch
         import verl
+        from trl import AutoModelForCausalLMWithValueHead
+        if AutoModelForCausalLMWithValueHead is None:
+            raise ImportError("TRL value-head API is unavailable")
         from verl.experimental.agent_loop.tool_parser import ToolParser
         from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
         from shopping_grpo.training.grpo.adapter.agent_loop import ShoppingToolAgentLoop
@@ -538,13 +632,27 @@ def main():
         from verl.utils.tracking import Tracking
     except ImportError as exc:
         raise SystemExit(
-            "incompatible veRL 0.8 install: required AgentLoop/Tool APIs are unavailable; "
+            "incompatible veRL/TRL install: required AgentLoop/Tool/value-head "
+            "APIs are unavailable; "
             f"original error: {exc}"
         ) from exc
 
     verl_source = Path(verl.__file__).resolve()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is unavailable in the GRPO environment")
+    checkpoint_backend = str(
+        config.actor_rollout_ref.rollout.checkpoint_engine.backend
+    ).lower()
+    if checkpoint_backend == "nccl":
+        from verl.checkpoint_engine import CheckpointEngineRegistry
+
+        try:
+            CheckpointEngineRegistry.get("nccl")
+        except KeyError:
+            raise SystemExit(
+                "NCCL checkpoint engine is unavailable; install cupy-cuda13x "
+                "for the pinned CUDA 13 runtime"
+            )
     if (
         not issubclass(ShoppingToolAgentLoop, ToolAgentLoop)
         or not issubclass(ShopSimulatorTool, BaseTool)

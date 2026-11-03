@@ -179,7 +179,7 @@ def build_experiment(
     command = [
         _python(root),
         "scripts/train_grpo.py",
-        "--model", str(model or root / "outputs/models/sft-merged"),
+        "--model", str(model or root / "outputs/models/sft-curriculum/stage-c/merged"),
         "--train-data", str(train_data or root / "data/grpo/train.parquet"),
         "--val-data", str(validation_data or root / "data/grpo/validation.parquet"),
         "--output", str(output),

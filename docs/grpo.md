@@ -26,7 +26,7 @@ unknown veRL version.
 ## Inputs
 
 - Initial policy for the current curriculum run:
-  `outputs/models/sft-qwen35-2b-curriculum/stage-c/merged`
+  `outputs/models/sft-curriculum/stage-c/merged`
 - Train set: `data/grpo/train.parquet` (994 tasks)
 - Validation set: `data/grpo/validation.parquet` (50 tasks)
 - Environment: ShopSimulator Environment v2.1
@@ -51,7 +51,7 @@ Inspect the resolved command first:
 
 ```bash
 bash scripts/grpo.sh \
-  --model outputs/models/sft-qwen35-2b-curriculum/stage-c/merged \
+  --model outputs/models/sft-curriculum/stage-c/merged \
   --train-data data/grpo/train.parquet \
   --val-data data/grpo/validation.parquet \
   --output outputs/models/grpo-qwen35-2b-stage-c-smoke \
@@ -63,7 +63,7 @@ Train the current Stage C initialization explicitly:
 
 ```bash
 bash scripts/grpo.sh \
-  --model outputs/models/sft-qwen35-2b-curriculum/stage-c/merged \
+  --model outputs/models/sft-curriculum/stage-c/merged \
   --train-data data/grpo/train.parquet \
   --val-data data/grpo/validation.parquet \
   --output outputs/models/grpo-qwen35-2b-stage-c-main \

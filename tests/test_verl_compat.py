@@ -19,7 +19,50 @@ class VerlCompatTest(unittest.TestCase):
         ray.get_runtime_context = lambda: context
         return ray
 
-    def test_pins_ray_gpu_before_verl_import_can_initialize_cuda(self):
+    def test_worker_defers_verl_import_until_ray_gpu_assignment(self):
+        ray = self._fake_ray(gpu_ids=("3",))
+        setter_calls = []
+
+        def set_visible_accelerator_ids(*args, **kwargs):
+            setter_calls.append(os.environ["CUDA_VISIBLE_DEVICES"])
+            os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+            return {"CUDA_VISIBLE_DEVICES": "0,1,2,3"}
+
+        ray_utils = ModuleType("ray._private.utils")
+        ray_utils.set_visible_accelerator_ids = set_visible_accelerator_ids
+        ray_private = ModuleType("ray._private")
+        ray_private.utils = ray_utils
+        ray._private = ray_private
+
+        modules = {
+            "ray": ray,
+            "ray._private": ray_private,
+            "ray._private.utils": ray_utils,
+        }
+        with patch(
+            "shopping_grpo.training.grpo.compat._install_torch_padding_fallback_impl"
+        ) as install_impl, patch.dict(
+            sys.modules, modules
+        ), patch.dict(
+            os.environ,
+            {
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR": "compat-hook",
+            },
+            clear=True,
+        ):
+            from shopping_grpo.training.grpo.compat import install_torch_padding_fallback
+
+            install_torch_padding_fallback()
+            self.assertEqual(setter_calls, [])
+            install_impl.assert_not_called()
+            ray_utils.set_visible_accelerator_ids()
+
+            self.assertEqual(setter_calls, ["0,1,2,3"])
+            install_impl.assert_called_once_with()
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "3")
+
+    def test_deferred_hook_installs_runtime_patches_after_assignment(self):
         attention = ModuleType("verl.utils.attention_utils")
         fallback = ModuleType("verl.utils.npu_flash_attn_utils")
         expected = tuple(object() for _ in range(4))
@@ -44,8 +87,20 @@ class VerlCompatTest(unittest.TestCase):
 
         ray_trainer.RayPPOTrainer = RayPPOTrainer
 
+        ray = self._fake_ray(gpu_ids=("3",))
+        ray_utils = ModuleType("ray._private.utils")
+
+        def set_visible_accelerator_ids():
+            os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
+        ray_utils.set_visible_accelerator_ids = set_visible_accelerator_ids
+        ray_private = ModuleType("ray._private")
+        ray_private.utils = ray_utils
+        ray._private = ray_private
         modules = {
-            "ray": self._fake_ray(gpu_ids=("3",)),
+            "ray": ray,
+            "ray._private": ray_private,
+            "ray._private.utils": ray_utils,
             "verl": verl,
             "verl.utils": utils,
             "verl.utils.attention_utils": attention,
@@ -54,7 +109,9 @@ class VerlCompatTest(unittest.TestCase):
             "verl.trainer.ppo": ppo,
             "verl.trainer.ppo.ray_trainer": ray_trainer,
         }
-        with patch.dict(sys.modules, modules), patch.dict(
+        with patch(
+            "shopping_grpo.training.grpo.compat.install_valuehead_attention_fallback"
+        ), patch.dict(sys.modules, modules), patch.dict(
             os.environ,
             {
                 "CUDA_VISIBLE_DEVICES": "0,1,2,3",
@@ -65,6 +122,8 @@ class VerlCompatTest(unittest.TestCase):
             from shopping_grpo.training.grpo.compat import install_torch_padding_fallback
 
             install_torch_padding_fallback()
+
+            ray_utils.set_visible_accelerator_ids()
 
             self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "3")
             self.assertEqual(attention._get_attention_functions(), expected)
@@ -119,7 +178,7 @@ class VerlCompatTest(unittest.TestCase):
                 _isolate_ray_worker_compile_caches()
                 self.assertEqual(os.environ["TRITON_CACHE_DIR"], str(triton))
 
-    def test_setup_hook_uses_verl_local_rank_before_ray_attaches_gpu_ids(self):
+    def test_setup_hook_does_not_guess_gpu_from_local_rank(self):
         from shopping_grpo.training.grpo.compat import _pin_ray_assigned_cuda_device
 
         with patch.dict(
@@ -137,9 +196,9 @@ class VerlCompatTest(unittest.TestCase):
         ):
             _pin_ray_assigned_cuda_device()
 
-            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "GPU-c")
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "GPU-a,GPU-b,GPU-c,GPU-d")
 
-    def test_setup_hook_preserves_non_contiguous_physical_gpu_mapping(self):
+    def test_setup_hook_keeps_non_contiguous_visibility_until_ray_assignment(self):
         from shopping_grpo.training.grpo.compat import _pin_ray_assigned_cuda_device
 
         with patch.dict(
@@ -157,7 +216,7 @@ class VerlCompatTest(unittest.TestCase):
         ):
             _pin_ray_assigned_cuda_device()
 
-            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "3")
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "1, 3")
 
     def test_setup_hook_without_verl_rank_metadata_keeps_visibility(self):
         from shopping_grpo.training.grpo.compat import _pin_ray_assigned_cuda_device
@@ -202,7 +261,9 @@ class VerlCompatTest(unittest.TestCase):
 
         ray_trainer.RayPPOTrainer = RayPPOTrainer
 
-        with patch.dict(
+        with patch(
+            "shopping_grpo.training.grpo.compat.install_valuehead_attention_fallback"
+        ), patch.dict(
             sys.modules,
             {
                 "verl": verl,
@@ -220,6 +281,90 @@ class VerlCompatTest(unittest.TestCase):
 
         self.assertEqual(attention._get_attention_functions(), expected)
         self.assertTrue(RayPPOTrainer._update_actor._shopping_trace)
+
+    def test_fully_async_critic_compat_uses_legacy_fsdp_fields(self):
+        import types
+
+        separation = types.ModuleType("verl.experimental.separation.ray_trainer")
+
+        class SeparateRayPPOTrainer:
+            def _create_critic_class(self):  # pragma: no cover - replaced below
+                raise AssertionError("original implementation should be replaced")
+
+        separation.SeparateRayPPOTrainer = SeparateRayPPOTrainer
+        role = types.SimpleNamespace(Critic="critic")
+        ray_module = types.ModuleType("verl.single_controller.ray")
+        ray_module.RayClassWithInitArgs = lambda **kwargs: kwargs
+        utils_config = types.ModuleType("verl.utils.config")
+        workers_config = types.ModuleType("verl.workers.config")
+        workers_engine = types.ModuleType("verl.workers.engine_workers")
+
+        class FSDPEngineConfig:
+            pass
+
+        class TrainingWorkerConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        workers_config.FSDPEngineConfig = FSDPEngineConfig
+        workers_engine.TrainingWorkerConfig = TrainingWorkerConfig
+        utils_config.omega_conf_to_dataclass = lambda config: config
+
+        modules = {
+            "verl": types.ModuleType("verl"),
+            "verl.experimental": types.ModuleType("verl.experimental"),
+            "verl.experimental.separation": types.ModuleType(
+                "verl.experimental.separation"
+            ),
+            "verl.single_controller": types.ModuleType("verl.single_controller"),
+            "verl.trainer": types.ModuleType("verl.trainer"),
+            "verl.trainer.ppo": types.ModuleType("verl.trainer.ppo"),
+            "verl.utils": types.ModuleType("verl.utils"),
+            "verl.workers": types.ModuleType("verl.workers"),
+            "verl.experimental.separation.ray_trainer": separation,
+            "verl.single_controller.ray": ray_module,
+            "verl.trainer.ppo.utils": types.SimpleNamespace(Role=role),
+            "verl.utils.config": utils_config,
+            "verl.workers.config": workers_config,
+            "verl.workers.engine_workers": workers_engine,
+        }
+        critic_model = object()
+        engine = types.SimpleNamespace()
+        critic_config = types.SimpleNamespace(
+            strategy="fsdp",
+            engine=engine,
+            model=critic_model,
+            optim=object(),
+            checkpoint=object(),
+            ppo_infer_max_token_len_per_gpu=11,
+            ppo_max_token_len_per_gpu=22,
+        )
+
+        class ResourcePools:
+            def get_resource_pool(self, name):
+                self.role = name
+                return "critic-pool"
+
+        trainer = types.SimpleNamespace(
+            use_critic=True,
+            resource_pool_manager=ResourcePools(),
+            config=types.SimpleNamespace(critic=critic_config),
+            role_worker_mapping={"critic": "critic-worker"},
+            resource_pool_to_cls={"critic-pool": {}},
+        )
+
+        with patch.dict(sys.modules, modules):
+            from shopping_grpo.training.grpo.compat import (
+                install_fully_async_critic_compat,
+            )
+
+            install_fully_async_critic_compat()
+            SeparateRayPPOTrainer._create_critic_class(trainer)
+            registered = trainer.resource_pool_to_cls["critic-pool"]["critic"]
+            self.assertEqual(registered["config"].model_config, critic_model)
+            self.assertIs(registered["config"].engine_config, engine)
+            self.assertEqual(engine.infer_max_token_len_per_gpu, 11)
+            self.assertEqual(engine.max_token_len_per_gpu, 22)
 
 
 if __name__ == "__main__":  # pragma: no cover

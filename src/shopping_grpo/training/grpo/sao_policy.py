@@ -110,12 +110,19 @@ def install_sao_gae() -> None:
     """Use the project-owned skip-observation GAE path for SAO batches."""
 
     from verl.trainer.ppo import core_algos, ray_trainer
+    # ``SeparateRayPPOTrainer`` imports ``compute_advantage`` into its own
+    # module namespace.  Patching only ray_trainer.compute_advantage therefore
+    # misses fully_async_policy; patch both call sites while keeping the
+    # wrapper idempotent for Ray worker setup hooks.
+    modules = [ray_trainer]
+    try:
+        from verl.experimental.separation import ray_trainer as separation_ray_trainer
 
-    original = ray_trainer.compute_advantage
-    if getattr(original, "_shopping_sao_wrapper", False):
-        return
+        modules.append(separation_ray_trainer)
+    except ImportError:
+        pass
 
-    def compute_advantage_with_sao(*args, **kwargs):
+    def compute_advantage_with_sao(original, *args, **kwargs):
         config = kwargs.get("config")
         if config is None and len(args) >= 7:
             config = args[6]
@@ -159,8 +166,16 @@ def install_sao_gae() -> None:
         data.batch["returns"] = returns
         return data
 
-    compute_advantage_with_sao._shopping_sao_wrapper = True
-    ray_trainer.compute_advantage = compute_advantage_with_sao
+    for module in modules:
+        original = module.compute_advantage
+        if getattr(original, "_shopping_sao_wrapper", False):
+            continue
+
+        def wrapped(*args, _original=original, **kwargs):
+            return compute_advantage_with_sao(_original, *args, **kwargs)
+
+        wrapped._shopping_sao_wrapper = True
+        module.compute_advantage = wrapped
 
 
 def install_sao_critic_freezing() -> None:
@@ -168,7 +183,7 @@ def install_sao_critic_freezing() -> None:
 
     import os
 
-    if os.environ.get("GRPO_CONFIG_NAME") != "sao":
+    if not os.environ.get("GRPO_CONFIG_NAME", "").startswith("sao"):
         return
     from verl.workers.engine.fsdp import transformer_impl
 

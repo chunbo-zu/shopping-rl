@@ -16,7 +16,8 @@ DEFAULT_CONFIG = ROOT / "configs/grpo.yaml"
 DEFAULT_AGENT_CONFIG = ROOT / "configs/agent_loop.yaml"
 DEFAULT_TOOL_CONFIG = ROOT / "configs/tools.json"
 DEFAULT_MANIFEST = ROOT / "data/environment.json"
-DEFAULT_MODEL = ROOT / "outputs/models/sft-merged"
+# The canonical GRPO/SAO initialization is the merged Stage C curriculum model.
+DEFAULT_MODEL = ROOT / "outputs/models/sft-curriculum/stage-c/merged"
 DEFAULT_TRAIN_DATA = ROOT / "data/grpo/train.parquet"
 DEFAULT_VAL_DATA = ROOT / "data/grpo/validation.parquet"
 ZMQ_IPC_PATH_MAX_BYTES = 107
@@ -40,7 +41,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-data", type=Path, default=DEFAULT_TRAIN_DATA)
     parser.add_argument("--val-data", type=Path, default=DEFAULT_VAL_DATA)
     parser.add_argument("--env-url", default="http://127.0.0.1:5700")
-    parser.add_argument("--output", type=Path, default=Path("outputs/models/grpo"))
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="output directory (default: outputs/models/{grpo,sao,sao-fully-async} by recipe)",
+    )
     parser.add_argument(
         "--logger",
         choices=("console", "swanlab"),
@@ -51,7 +56,18 @@ def parse_args() -> argparse.Namespace:
         "--config",
         type=Path,
         default=DEFAULT_CONFIG,
-        help="Hydra recipe, e.g. configs/grpo.yaml or configs/sao.yaml",
+        help=(
+            "Hydra recipe, e.g. configs/grpo.yaml, configs/sao.yaml, "
+            "or configs/sao_fully_async.yaml"
+        ),
+    )
+    parser.add_argument(
+        "--fully-async",
+        action="store_true",
+        help=(
+            "run veRL's fully_async_policy entrypoint; this is enabled "
+            "automatically for configs/sao_fully_async.yaml"
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -134,7 +150,13 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     train_data = _validated_path(args.train_data, "train parquet")
     val_data = _validated_path(args.val_data, "validation parquet")
     config = _validated_path(args.config, "GRPO example config")
-    output = args.output.expanduser().resolve()
+    fully_async = args.fully_async or config.stem == "sao_fully_async"
+    output_name = "grpo"
+    if config.stem.startswith("sao"):
+        output_name = "sao-fully-async" if fully_async else "sao"
+    output = (
+        args.output if args.output is not None else Path("outputs/models") / output_name
+    ).expanduser().resolve()
     vllm_rpc_base_path = _vllm_rpc_base_path(output)
     python_multiprocessing_tmpdir = _python_multiprocessing_tmpdir(output)
     if output.exists():
@@ -170,6 +192,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
             "SHOPPING_AGENT_LOOP_CONFIG": str(DEFAULT_AGENT_CONFIG),
             "SHOPPING_TOOL_CONFIG": str(DEFAULT_TOOL_CONFIG),
             "GRPO_CONFIG_NAME": config.stem,
+            "GRPO_FULLY_ASYNC": "1" if fully_async else "0",
         }
     )
     if args.logger == "swanlab":
@@ -180,10 +203,15 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
             }
         )
     overrides = _hydra_overrides(args)
+    module = (
+        "shopping_grpo.training.grpo.fully_async_main"
+        if fully_async
+        else "verl.trainer.main_ppo"
+    )
     command = [
         sys.executable,
         "-m",
-        "verl.trainer.main_ppo",
+        module,
         f"--config-path={config.parent}",
         f"--config-name={config.stem}",
         *overrides,
@@ -205,6 +233,7 @@ def main() -> None:
         "python_tmpdir": environment["TMPDIR"],
         "logger": args.logger,
         "config": str(args.config.resolve()),
+        "fully_async": environment["GRPO_FULLY_ASYNC"] == "1",
     }
     print(json.dumps(audit, ensure_ascii=False, indent=2))
     if args.dry_run:

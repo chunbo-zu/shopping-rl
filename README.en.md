@@ -287,8 +287,13 @@ bash scripts/serve_model.sh outputs/models/grpo-merged
 bash scripts/evaluate.sh grpo
 ```
 
-Generated checkpoints, rollouts and logs are written under `outputs/`, which is
-ignored by Git.
+Run artifacts are written under `outputs/`. Git retains the training logs in
+`outputs/logs/`, evaluation trajectories and reports in `outputs/evaluation/`,
+and training diagnostics, SFT summaries and trainer state, Hydra configurations,
+and SwanLab run records under `outputs/models/`. Model weights, optimizer state,
+generated tokenizers and compilation caches remain ignored.
+SwanLab generates its own ignore files; explicitly stage new run records with
+`git add -f`.
 
 ## Reward V3 overview
 

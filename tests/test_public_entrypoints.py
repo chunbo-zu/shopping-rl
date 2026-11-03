@@ -107,6 +107,45 @@ class PublicEntrypointTest(unittest.TestCase):
         self.assertEqual(environment["SHOPPING_PYTHON_TMPDIR"], environment["TMPDIR"])
         self.assertIn("trainer.logger=[console]", command)
 
+    def test_public_grpo_launcher_selects_fully_async_entrypoint(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            model = temporary / "model"
+            model.mkdir()
+            (model / "config.json").write_text("{}", encoding="utf-8")
+            (model / "model.safetensors").write_bytes(b"example")
+            train = temporary / "train.parquet"
+            train.write_bytes(b"example")
+            validation = temporary / "validation.parquet"
+            validation.write_bytes(b"example")
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "train_grpo.py",
+                    "--model",
+                    str(model),
+                    "--train-data",
+                    str(train),
+                    "--val-data",
+                    str(validation),
+                    "--output",
+                    str(temporary / "output"),
+                    "--config",
+                    str(root / "configs/sao_fully_async.yaml"),
+                    "--dry-run",
+                ],
+            ):
+                args = parse_args()
+            command, environment = build_command(args)
+
+        self.assertIn(
+            "shopping_grpo.training.grpo.fully_async_main",
+            command,
+        )
+        self.assertEqual(environment["GRPO_FULLY_ASYNC"], "1")
+
     def test_public_grpo_launcher_rejects_long_vllm_rpc_path(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:

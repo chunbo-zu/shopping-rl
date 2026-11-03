@@ -312,7 +312,11 @@ bash scripts/report_all.sh
 
 报告生成器按评测目录读取 `summary.json` 和 `trajectories.jsonl`，模型名与评测参数会从结果中自动填入，因此换模型或换评测标签不需要修改报告代码。
 
-Checkpoint、Rollout 和日志统一写入 Git 忽略的 `outputs/`。
+运行产物统一写入 `outputs/`。仓库保留 `outputs/logs/` 中的训练日志、
+`outputs/evaluation/` 中的评估轨迹与报告，以及 `outputs/models/` 中的
+训练诊断、SFT 训练摘要与状态、Hydra 配置和 SwanLab 运行记录。
+模型权重、优化器状态、生成的 tokenizer 和编译缓存不纳入 Git。
+SwanLab 会自动生成忽略文件，新增运行记录需使用 `git add -f` 显式纳入提交。
 
 ## Reward v3 简介
 

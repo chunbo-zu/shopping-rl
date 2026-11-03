@@ -34,53 +34,44 @@ def _isolate_ray_worker_compile_caches():
 
 
 def _pin_ray_assigned_cuda_device():
-    """Apply Ray's GPU assignment before importing PyTorch through veRL.
+    """Compatibility no-op kept for callers of the old startup hook.
 
-    Ray invokes ``worker_process_setup_hook`` before it applies the actor's
-    accelerator visibility.  Importing the veRL trainer from that hook imports
-    PyTorch and lets CUDA cache the driver's full device list.  Later changes to
-    ``CUDA_VISIBLE_DEVICES`` then arrive too late, so every distributed rank uses
-    physical GPU 0.  Restrict visibility from Ray's already-known assignment
-    before any veRL/PyTorch import can initialize CUDA.
+    Ray applies ``CUDA_VISIBLE_DEVICES`` in its worker loop *after* the
+    process setup hook.  Guessing a device from ``RANK`` here is unsafe for
+    the fully-async topology: every single-GPU rollout replica has rank zero,
+    while Ray may place those replicas on different physical GPUs.  The
+    actual fix is installed by :func:`_defer_runtime_hooks_until_ray_gpu`.
     """
-    import os
+    return None
 
-    # ``ray.is_initialized()`` is false while the process setup hook runs even
-    # though the worker is already connected and has resource IDs.  The
-    # reserved hook variable distinguishes that phase from the preflight's
-    # ordinary, pre-ray invocation without accidentally starting local Ray.
-    if "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR" not in os.environ:
-        return
 
+def _defer_runtime_hooks_until_ray_gpu():
+    """Run veRL imports immediately after Ray assigns the worker's GPU.
+
+    ``worker_process_setup_hook`` runs before Ray calls
+    ``set_visible_accelerator_ids``.  Importing veRL/PyTorch in that hook can
+    therefore initialize CUDA against the driver's full device list.  Wrap
+    Ray's private setter, let it finish first, and only then install the
+    project runtime patches.  The wrapper is process-local and idempotent;
+    later Ray tasks in a reused worker only execute the original setter.
+    """
     import ray
-
-    gpu_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
-    if gpu_ids:
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+    from ray._private import utils as ray_utils
+    original = ray_utils.set_visible_accelerator_ids
+    if getattr(original, "_shopping_deferred_runtime_hooks", False):
         return
 
-    # Ray executes the process hook while preparing the runtime environment,
-    # before the actor's resource IDs are attached to the worker.  veRL does,
-    # however, put the rank topology into that runtime environment, and its
-    # placement-group bundle ``local_rank`` is the corresponding GPU index.
-    rank = os.environ.get("RANK")
-    local_world_size = os.environ.get("RAY_LOCAL_WORLD_SIZE")
-    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if rank is None or local_world_size is None or not visible_devices:
-        return
-    local_size = int(local_world_size)
-    if local_size <= 0:
-        raise RuntimeError("RAY_LOCAL_WORLD_SIZE must be positive")
-    devices = [device.strip() for device in visible_devices.split(",")]
-    if not all(devices):
-        raise RuntimeError(f"invalid CUDA_VISIBLE_DEVICES: {visible_devices!r}")
-    local_rank = int(rank) % local_size
-    if local_rank >= len(devices):
-        raise RuntimeError(
-            "veRL rank topology exceeds CUDA_VISIBLE_DEVICES: "
-            f"local_rank={local_rank}, visible_devices={visible_devices}"
-        )
-    os.environ["CUDA_VISIBLE_DEVICES"] = devices[local_rank]
+    def set_visible_accelerator_ids_after_ray_assignment(*args, **kwargs):
+        result = original(*args, **kwargs)
+        _install_torch_padding_fallback_impl()
+        return result
+
+    set_visible_accelerator_ids_after_ray_assignment._shopping_deferred_runtime_hooks = (
+        True
+    )
+    ray_utils.set_visible_accelerator_ids = (
+        set_visible_accelerator_ids_after_ray_assignment
+    )
 
 
 def _install_trace_actor_update():
@@ -137,11 +128,192 @@ def _install_trace_actor_update():
     RayPPOTrainer._update_actor = update_actor_with_trace
 
 
-def install_torch_padding_fallback():
-    """安装项目所需的 veRL 窄范围 runtime hooks。"""
-    _isolate_ray_worker_compile_caches()
-    _pin_ray_assigned_cuda_device()
+def install_fully_async_critic_compat():
+    """Bridge veRL 0.8's separation trainer to its critic config schema.
 
+    The published fully-async trainer reads ``critic.model.fsdp_config`` and
+    ``critic.model_config``.  veRL 0.8's ``FSDPCriticConfig`` stores the model
+    under ``critic.model`` and the engine under ``critic.engine`` instead.
+    Keep the project recipe on the stable public config shape and adapt only
+    this narrow worker-construction boundary.
+    """
+    from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
+
+    original = SeparateRayPPOTrainer._create_critic_class
+    if getattr(original, "_shopping_fully_async_critic_compat", False):
+        return
+
+    def create_critic_class(self):
+        if not self.use_critic:
+            return
+
+        from verl.single_controller.ray import RayClassWithInitArgs
+        from verl.trainer.ppo.utils import Role
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.workers.config import FSDPEngineConfig
+        from verl.workers.engine_workers import TrainingWorkerConfig
+
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+        critic_config = omega_conf_to_dataclass(self.config.critic)
+        self.orig_critic_cfg = critic_config
+        if critic_config.strategy != "fsdp":
+            raise NotImplementedError(
+                f"Unknown strategy for fully-async critic: {critic_config.strategy=}"
+            )
+
+        # FSDPCriticConfig exposes the engine as ``engine`` (and ``fsdp``),
+        # while newer separation code expects it below the model config.
+        engine_config: FSDPEngineConfig = getattr(critic_config, "engine", None)
+        if engine_config is None:
+            engine_config = getattr(critic_config.model, "fsdp_config", None)
+        if engine_config is None:
+            raise AttributeError(
+                "fully-async critic requires an FSDP engine config at "
+                "critic.engine or critic.model.fsdp_config"
+            )
+        engine_config.infer_max_token_len_per_gpu = (
+            critic_config.ppo_infer_max_token_len_per_gpu
+        )
+        engine_config.max_token_len_per_gpu = critic_config.ppo_max_token_len_per_gpu
+
+        # TrainingWorker consumes the regular HF model config.  The upstream
+        # separation trainer's ``model_config`` attribute is absent in veRL 0.8.
+        worker_config = TrainingWorkerConfig(
+            model_type="value_model",
+            model_config=critic_config.model,
+            engine_config=engine_config,
+            optimizer_config=critic_config.optim,
+            checkpoint_config=critic_config.checkpoint,
+        )
+        critic_cls = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[Role.Critic],
+            config=worker_config,
+        )
+        self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
+
+    create_critic_class._shopping_fully_async_critic_compat = True
+    SeparateRayPPOTrainer._create_critic_class = create_critic_class
+
+
+def install_fully_async_trainer_compat():
+    """Install veRL 0.8's missing async critic initialization compatibility."""
+    from functools import partial
+
+    from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+    from verl.trainer.ppo.utils import Role
+    from verl.workers.utils.losses import value_loss
+
+    # ``@ray.remote`` returns an ActorClass wrapper. Patching a method on that
+    # wrapper does not change the class Ray serializes to the worker; the
+    # executable class is stored in ``__ray_metadata__.modified_class``.
+    target = getattr(
+        getattr(FullyAsyncTrainer, "__ray_metadata__", None),
+        "modified_class",
+        FullyAsyncTrainer,
+    )
+    original = target._init_models
+    if getattr(original, "_shopping_fully_async_trainer_compat", False):
+        return
+
+    def init_models(self):
+        # veRL 0.8's SeparateRayPPOTrainer creates the critic with the unified
+        # TrainingWorker, whose public initialization method is ``reset``.
+        # The experimental async trainer calls ``init_model`` here, which is
+        # only available on actor/rollout worker groups.
+        if self.use_critic:
+            self.critic_wg = self.all_wg[str(Role.Critic)]
+            self.critic_wg.reset()
+            self.critic_wg.set_loss_fn(partial(value_loss, config=self.orig_critic_cfg))
+
+        if self.use_reference_policy and not self.ref_in_actor:
+            self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]
+            self.ref_policy_wg.init_model()
+
+        self.actor_wg = self.all_wg[str(self.train_role)]
+        self.actor_wg.init_model()
+        self.actor_rollout_wg = self.actor_wg
+
+    init_models._shopping_fully_async_trainer_compat = True
+    target._init_models = init_models
+
+
+def install_valuehead_attention_fallback():
+    """Use SDPA for veRL's value-head loader when FlashAttention is absent.
+
+    veRL 0.8 hard-codes ``flash_attention_2`` in ``load_valuehead_model``.
+    The actor recipe already selects SDPA, but the critic takes a separate
+    value-model path and otherwise fails before training starts when the
+    optional ``flash-attn`` wheel is not installed.  Keep this patch local to
+    the critic loader so actor and rollout attention settings are unchanged.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("flash_attn") is not None:
+        return
+
+    try:
+        from verl.utils import model as model_utils
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        # Lightweight unit-test fakes do not provide veRL's model module.
+        return
+
+    original = model_utils.load_valuehead_model
+    if getattr(original, "_shopping_sdpa_fallback", False):
+        return
+
+    def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
+        from transformers import AutoModelForCausalLM, AutoModelForTokenClassification
+
+        attention_implementation = "sdpa"
+        try:
+            model = AutoModelForTokenClassification.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                torch_dtype=torch_dtype,
+                config=model_config,
+                attn_implementation=attention_implementation,
+                trust_remote_code=trust_remote_code,
+            )
+            return model
+        except Exception as exc:
+            if not model_utils.is_trl_available():
+                raise RuntimeError(
+                    f"model({local_path}) is not a value head model, "
+                    "please install trl to make it valid"
+                ) from exc
+
+        from trl import AutoModelForCausalLMWithValueHead
+
+        vision_auto_model = model_utils.AutoModelForVision2Seq
+        if (
+            vision_auto_model is not None
+            and type(model_config) in vision_auto_model._model_mapping.keys()
+        ):
+            module_class = vision_auto_model
+        else:
+            module_class = AutoModelForCausalLM
+        ori_model = module_class.from_pretrained(
+            pretrained_model_name_or_path=local_path,
+            torch_dtype=torch_dtype,
+            config=model_config,
+            attn_implementation=attention_implementation,
+            trust_remote_code=trust_remote_code,
+        )
+        if hasattr(model_config, "text_config"):
+            ori_model.config.hidden_size = model_config.text_config.hidden_size
+        model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
+        model_utils.patch_valuehead_model(model)
+        return model
+
+    load_valuehead_model._shopping_sdpa_fallback = True
+    model_utils.load_valuehead_model = load_valuehead_model
+
+
+def _install_torch_padding_fallback_impl():
+    """Install hooks once, after CUDA visibility has been finalized."""
+    import os
+
+    if os.environ.get("SHOPPING_GRPO_RUNTIME_HOOKS_INSTALLED") == "1":
+        return
     from verl.utils import attention_utils
     from verl.utils import npu_flash_attn_utils as fallback
 
@@ -153,6 +325,7 @@ def install_torch_padding_fallback():
     )
     # ponytail: veRL 0.8 在 CUDA 上硬导入 FA2；上游提供 torch fallback 后删除此 hook。
     attention_utils._get_attention_functions = lambda: functions
+    install_valuehead_attention_fallback()
     # SAO uses veRL bypass mode to carry the asynchronous rollout log-probs
     # into the actor update.  The guarded adapter is a no-op for the existing
     # GRPO configuration and only dispatches when the typed sao_dis loss
@@ -164,6 +337,11 @@ def install_torch_padding_fallback():
     )
 
     try:
+        # Ray workers import veRL afresh, so the driver-side wrapper alone is
+        # insufficient. Install the async shims in the runtime setup hook too.
+        if os.environ.get("GRPO_FULLY_ASYNC") == "1":
+            install_fully_async_critic_compat()
+            install_fully_async_trainer_compat()
         install_sao_policy_loss()
         install_sao_gae()
         install_sao_critic_freezing()
@@ -174,3 +352,21 @@ def install_torch_padding_fallback():
         if "core_algos" not in str(exc):
             raise
     _install_trace_actor_update()
+    os.environ["SHOPPING_GRPO_RUNTIME_HOOKS_INSTALLED"] = "1"
+
+
+def install_torch_padding_fallback():
+    """安装项目所需的 veRL 窄范围 runtime hooks。
+
+    In a Ray worker the setup hook only installs a small wrapper around Ray's
+    accelerator setter.  This keeps all CUDA-touching imports after Ray has
+    selected the physical device.  Driver-side preflight calls still install
+    the hooks immediately.
+    """
+    import os
+
+    _isolate_ray_worker_compile_caches()
+    if "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR" in os.environ:
+        _defer_runtime_hooks_until_ray_gpu()
+        return
+    _install_torch_padding_fallback_impl()

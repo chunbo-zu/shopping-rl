@@ -114,7 +114,12 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
         sampling_params,
         ignore_termination=False,
     ):
-        """在每次生成前执行上下文预算检查，并限制本轮最大输出长度。"""
+        """
+        在每次生成前执行上下文预算检查，并限制本轮最大输出长度。
+        在送模型前解决上下文问题。
+
+        """
+        # current_runtime_state 是 ContextVar，session 在 run() 里设置。这里想要得到总规模
         runtime_state = current_runtime_state.get()
         current_input_tokens = len(agent_data.prompt_ids)
         if runtime_state is not None:
@@ -124,6 +129,7 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
             )
         if self.context_compaction_enable:
             try:
+                # 调用轨迹压缩，我们在压缩轨迹的时候，需要传id，logprobs和mask进行同步压缩，否则会有错位问题
                 prompt_ids, response_mask, response_logprobs, stats = compact_token_trajectory(
                     agent_data.prompt_ids,
                     agent_data.response_mask,
@@ -131,7 +137,7 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
                     max_input_tokens=self.context_input_budget,
                     preserve_recent_groups=self.context_preserve_recent_groups,
                 )
-            except ContextBudgetError as exc:
+            except ContextBudgetError as exc:#如果这里压缩了还是超限制，就返回终止
                 if runtime_state is not None:
                     runtime_state["terminate"] = True
                     runtime_state["termination_reason"] = "context_budget_exhausted"
@@ -142,13 +148,14 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
             prompt_ids = agent_data.prompt_ids
             response_mask = agent_data.response_mask
             response_logprobs = agent_data.response_logprobs
-            stats = None
+            stats = None #标记没有压缩
         if (
             not self.context_compaction_enable
             and current_input_tokens
             > self.context_window_tokens
             - self.context_generation_reserve_tokens
             - self.context_safety_margin_tokens
+            # 这里说明窗口超出限制之后怎么处理
         ):
             if runtime_state is not None:
                 runtime_state["terminate"] = True
@@ -158,6 +165,7 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
             return AgentState.TERMINATED
         if stats is not None and stats.removed_tokens:
             # routed-experts 的额外状态无法随 token 一起安全裁剪，因此直接判为无效。
+            # 这里如果采用MoE模型，就会有一个额外的字段保存路由到的专家，但是在这里因为每个模型的MoE结构不一样，我们没有办法去裁剪，直接终止
             if agent_data.routed_experts is not None:
                 if runtime_state is not None:
                     runtime_state["terminate"] = True
